@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoBG Studio AI - Pengganti Background Foto</title>
+    
+    <!-- Mengimpor Tailwind CSS untuk styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Konfigurasi Import Map untuk modul React dan Lucide -->
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "lucide-react": "https://esm.sh/lucide-react@0.292.0?deps=react@18.2.0"
+        }
+    }
+    </script>
+    
+    <!-- Mengimpor Babel Standalone untuk kompilasi JSX langsung di browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        /* Mencegah scroll horizontal berlebih */
+        body { overflow-x: hidden; }
+    </style>
+</head>
+<body class="bg-[#050811]">
+    <!-- Container utama untuk aplikasi React -->
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useRef } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { 
+            Upload, Image as ImageIcon, Sparkles, Download, RefreshCw, 
+            Sliders, Check, Layers, Maximize2, Trash2, Info, ArrowRight, 
+            ZoomIn, Settings2, Ratio 
+        } from 'lucide-react';
+
+        function App() {
+            // API Key disediakan oleh runtime environment (Silakan isi dengan key valid Anda)
+            const apiKey = "";
+
+            // State untuk unggahan foto
+            const [subjectImage, setSubjectImage] = useState(null); // { file, url, base64, mimeType, width, height }
+            const [bgImage, setBgImage] = useState(null); // { file, url, base64, mimeType, width, height }
+
+            // State untuk rasio dan resolusi
+            const [ratioMode, setRatioMode] = useState('original'); // 'original', '1:1', '9:16', '16:9', '4:5', '4:3', '3:4', 'custom'
+            const [customRatio, setCustomRatio] = useState({ w: 16, h: 9 });
+            
+            const [resolutionMode, setResolutionMode] = useState('1080p'); // 'original', '720p', '1080p', '2k', '4k', 'custom'
+            const [customResolution, setCustomResolution] = useState({ width: 1920, height: 1080 });
+
+            // State proses
+            const [loading, setLoading] = useState(false);
+            const [loadingStep, setLoadingStep] = useState('');
+            const [errorMessage, setErrorMessage] = useState(null);
+            const [resultImage, setResultImage] = useState(null);
+            const [resultDimensions, setResultDimensions] = useState(null);
+            const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+
+            // File input refs
+            const subjectInputRef = useRef(null);
+            const bgInputRef = useRef(null);
+
+            // Konversi file ke base64 & hitung dimensi natural
+            const handleFileProcessing = (file, isSubject = true) => {
+                if (!file || !file.type.startsWith('image/')) {
+                    setErrorMessage('Harap unggah berkas gambar yang valid (JPG, PNG, WebP).');
+                    return;
+                }
+                setErrorMessage(null);
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const dataUrl = e.target.result;
+                    const base64Data = dataUrl.split(',')[1];
+                    const mimeType = file.type || 'image/jpeg';
+
+                    const img = new Image();
+                    img.onload = () => {
+                        const payload = {
+                            file,
+                            url: dataUrl,
+                            base64: base64Data,
+                            mimeType,
+                            width: img.naturalWidth,
+                            height: img.naturalHeight
+                        };
+                        if (isSubject) {
+                            setSubjectImage(payload);
+                        } else {
+                            setBgImage(payload);
+                        }
+                    };
+                    img.src = dataUrl;
+                };
+                reader.readAsDataURL(file);
+            };
+
+            // Helper retry exponential backoff
+            const callGeminiWithBackoff = async (payload, maxRetries = 5) => {
+                const delays = [1000, 2000, 4000, 8000, 16000];
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key=${apiKey}`;
+
+                for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!response.ok) {
+                            const errText = await response.text();
+                            throw new Error(`Status ${response.status}: ${errText}`);
+                        }
+
+                        const data = await response.json();
+                        return data;
+                    } catch (err) {
+                        if (attempt === maxRetries) {
+                            throw err;
+                        }
+                        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+                    }
+                }
+            };
+
+            // Menghitung dimensi target piksel berdasarkan rasio & opsi resolusi
+            const calculateTargetDimensions = () => {
+                let targetRatioNum = 1;
+                if (ratioMode === 'original') {
+                    targetRatioNum = subjectImage ? subjectImage.width / subjectImage.height : 1;
+                } else if (ratioMode === '1:1') targetRatioNum = 1;
+                else if (ratioMode === '9:16') targetRatioNum = 9 / 16;
+                else if (ratioMode === '16:9') targetRatioNum = 16 / 9;
+                else if (ratioMode === '4:5') targetRatioNum = 4 / 5;
+                else if (ratioMode === '4:3') targetRatioNum = 4 / 3;
+                else if (ratioMode === '3:4') targetRatioNum = 3 / 4;
+                else if (ratioMode === 'custom') {
+                    const rw = Math.max(1, Number(customRatio.w) || 1);
+                    const rh = Math.max(1, Number(customRatio.h) || 1);
+                    targetRatioNum = rw / rh;
+                }
+
+                let targetWidth = 1920;
+                let targetHeight = 1080;
+
+                if (resolutionMode === 'original' && subjectImage) {
+                    targetWidth = subjectImage.width;
+                    targetHeight = Math.round(targetWidth / targetRatioNum);
+                } else if (resolutionMode === '720p') {
+                    if (targetRatioNum >= 1) {
+                        targetHeight = 720;
+                        targetWidth = Math.round(720 * targetRatioNum);
+                    } else {
+                        targetWidth = 720;
+                        targetHeight = Math.round(720 / targetRatioNum);
+                    }
+                } else if (resolutionMode === '1080p') {
+                    if (targetRatioNum >= 1) {
+                        targetHeight = 1080;
+                        targetWidth = Math.round(1080 * targetRatioNum);
+                    } else {
+                        targetWidth = 1080;
+                        targetHeight = Math.round(1080 / targetRatioNum);
+                    }
+                } else if (resolutionMode === '2k') {
+                    if (targetRatioNum >= 1) {
+                        targetHeight = 1440;
+                        targetWidth = Math.round(1440 * targetRatioNum);
+                    } else {
+                        targetWidth = 1440;
+                        targetHeight = Math.round(1440 / targetRatioNum);
+                    }
+                } else if (resolutionMode === '4k') {
+                    if (targetRatioNum >= 1) {
+                        targetHeight = 2160;
+                        targetWidth = Math.round(2160 * targetRatioNum);
+                    } else {
+                        targetWidth = 2160;
+                        targetHeight = Math.round(2160 / targetRatioNum);
+                    }
+                } else if (resolutionMode === 'custom') {
+                    targetWidth = Math.max(100, Math.min(7680, Number(customResolution.width) || 1920));
+                    targetHeight = Math.max(100, Math.min(4320, Number(customResolution.height) || 1080));
+                }
+
+                targetWidth = Math.round(targetWidth / 2) * 2;
+                targetHeight = Math.round(targetHeight / 2) * 2;
+
+                return { targetWidth, targetHeight, targetRatioNum };
+            };
+
+            // Proses canvas untuk mengatur resolusi dan aspect ratio secara presisi
+            const adjustCanvasDimensions = (imageSrc, targetW, targetH) => {
+                return new Promise((resolve) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = targetW;
+                        canvas.height = targetH;
+                        const ctx = canvas.getContext('2d');
+
+                        const imgRatio = img.naturalWidth / img.naturalHeight;
+                        const targetRatio = targetW / targetH;
+                        let sx = 0, sy = 0, sWidth = img.naturalWidth, sHeight = img.naturalHeight;
+
+                        if (imgRatio > targetRatio) {
+                            sWidth = img.naturalHeight * targetRatio;
+                            sx = (img.naturalWidth - sWidth) / 2;
+                        } else {
+                            sHeight = img.naturalWidth / targetRatio;
+                            sy = (img.naturalHeight - sHeight) / 2;
+                        }
+
+                        ctx.imageSmoothingEnabled = true;
+                        ctx.imageSmoothingQuality = 'high';
+                        ctx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, targetW, targetH);
+
+                        resolve(canvas.toDataURL('image/png', 1.0));
+                    };
+                    img.src = imageSrc;
+                });
+            };
+
+            // Eksekusi Pergantian Background
+            const handleGenerate = async () => {
+                if (!subjectImage || !bgImage) {
+                    setErrorMessage('Silakan unggah Foto Subjek dan Foto Background terlebih dahulu.');
+                    return;
+                }
+
+                setLoading(true);
+                setErrorMessage(null);
+                setLoadingStep('Mengirim foto subjek & latar belakang ke AI...');
+
+                const { targetWidth, targetHeight } = calculateTargetDimensions();
+
+                const promptText = `TASK: Precise Background Replacement.
+You are given two images:
+1. First image: The foreground subject (person, product, or main object).
+2. Second image: The new background.
+
+Instructions:
+- Seamlessly isolate and extract the main subject from the first image with crisp edges, hair fidelity, and clean masking.
+- Replace the entire original background with the environment provided in the second image.
+- Naturally blend the lighting, color tone, highlights, reflections, and contact shadows between the subject and the new background.
+- Target composition: Create a cohesive, realistic photograph formatted appropriately for aspect ratio (${targetWidth}x${targetHeight}).
+- Return ONLY the final composite image.`;
+
+                const requestPayload = {
+                    contents: [
+                        {
+                            parts: [
+                                { text: promptText },
+                                { inlineData: { mimeType: subjectImage.mimeType, data: subjectImage.base64 } },
+                                { inlineData: { mimeType: bgImage.mimeType, data: bgImage.base64 } }
+                            ]
+                        }
+                    ],
+                    generationConfig: {
+                        responseModalities: ['TEXT', 'IMAGE']
+                    }
+                };
+
+                try {
+                    setLoadingStep('AI sedang memisahkan subjek & menggabungkan latar...');
+                    const response = await callGeminiWithBackoff(requestPayload);
+
+                    const imagePart = response.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+
+                    if (!imagePart || !imagePart.inlineData?.data) {
+                        throw new Error('AI tidak mengembalikan citra gambar yang valid. Silakan coba kembali.');
+                    }
+
+                    setLoadingStep('Menyesuaikan rasio & resolusi akhir...');
+                    const rawAiImageUrl = `data:${imagePart.inlineData.mimeType || 'image/png'};base64,${imagePart.inlineData.data}`;
+
+                    const finalizedImageUrl = await adjustCanvasDimensions(rawAiImageUrl, targetWidth, targetHeight);
+
+                    setResultImage(finalizedImageUrl);
+                    setResultDimensions({ width: targetWidth, height: targetHeight });
+                    setLoadingStep('');
+                } catch (err) {
+                    console.error(err);
+                    setErrorMessage(err.message || 'Gagal menghasilkan gambar. Terjadi kesalahan pada server AI.');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleDownload = () => {
+                if (!resultImage) return;
+                const a = document.createElement('a');
+                a.href = resultImage;
+                a.download = `Background-Replaced-${resultDimensions ? `${resultDimensions.width}x${resultDimensions.height}` : 'AI'}.png`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            };
+
+            const activeRatioData = calculateTargetDimensions();
+
+            return (
+                <div className="min-h-screen text-slate-100 flex flex-col font-sans selection:bg-blue-600 selection:text-white relative overflow-x-hidden w-full">
+                    {/* Background Decorator Gradients */}
+                    <div className="absolute top-0 left-1/4 w-96 h-96 bg-blue-600/10 rounded-full blur-[130px] pointer-events-none" />
+                    <div className="absolute top-1/3 right-10 w-[30rem] h-[30rem] bg-cyan-600/10 rounded-full blur-[160px] pointer-events-none" />
+                    <div className="absolute bottom-10 left-1/3 w-80 h-80 bg-indigo-600/10 rounded-full blur-[140px] pointer-events-none" />
+
+                    {/* Top Navigation Bar */}
+                    <header className="border-b border-blue-900/30 bg-[#070c1a]/80 backdrop-blur-md sticky top-0 z-40 px-6 py-4">
+                        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
+                            <div className="flex items-center gap-3">
+                                <div className="h-10 w-10 shrink-0 rounded-xl bg-gradient-to-tr from-blue-600 via-blue-500 to-cyan-400 p-[1px] shadow-lg shadow-blue-500/20">
+                                    <div className="w-full h-full bg-[#090e1f] rounded-[11px] flex items-center justify-center text-cyan-400">
+                                        <Sparkles className="w-5 h-5" />
+                                    </div>
+                                </div>
+                                <div>
+                                    <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-white via-slate-100 to-blue-300 bg-clip-text text-transparent">
+                                        AutoBG Studio AI
+                                    </h1>
+                                    <p className="text-xs text-blue-400/80 font-medium">Pengganti Background Foto Profesional</p>
+                                    <div className="flex items-center gap-1.5 mt-0.5">
+                                        <span className="text-[11px] text-slate-300 font-medium tracking-wide">
+                                            Created By: FAISAL ADI PRIATNA
+                                        </span>
+                                        <svg className="w-3.5 h-3.5 text-blue-400 shrink-0 inline-block drop-shadow-[0_0_6px_rgba(96,165,250,0.5)]" viewBox="0 0 24 24" fill="currentColor">
+                                            <path fillRule="evenodd" d="M8.603 3.799A4.49 4.49 0 0112 2.25c1.357 0 2.573.6 3.397 1.549a4.49 4.49 0 013.498 1.307 4.491 4.491 0 011.307 3.497A4.49 4.49 0 0121.75 12a4.49 4.49 0 01-1.549 3.397 4.491 4.491 0 01-1.307 3.497 4.491 4.491 0 01-3.497 1.307A4.49 4.49 0 0112 21.75a4.49 4.49 0 01-3.397-1.549 4.49 4.49 0 01-3.498-1.306 4.491 4.491 0 01-1.307-3.498A4.49 4.49 0 012.25 12c0-1.357.6-2.573 1.549-3.397a4.49 4.49 0 011.307-3.497 4.49 4.49 0 013.497-1.307zm7.007 6.387a.75.75 0 10-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 00-1.06 1.06l2.25 2.25a.75.75 0 001.14-.094l3.75-5.25z" clipRule="evenodd" />
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2 text-xs text-slate-400 bg-blue-950/40 border border-blue-500/20 px-3.5 py-1.5 rounded-full shadow-inner">
+                                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                                <span>Google Gemini Connected</span>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Main Content Area */}
+                    <main className="max-w-7xl mx-auto w-full px-4 sm:px-6 py-8 flex-1 flex flex-col gap-8">
+                        <div className="text-center max-w-2xl mx-auto">
+                            <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white mb-2">
+                                Ganti Latar Foto Secara Cerdas & Presisi
+                            </h2>
+                            <p className="text-sm text-slate-400">
+                                Unggah foto subjek utama Anda dan foto background impian, atur aspek rasio serta resolusi gambar sesuai kebutuhan Anda.
+                            </p>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {/* Card 1: Foto Subjek */}
+                            <div className="relative group rounded-2xl p-[1px] bg-gradient-to-b from-blue-500/30 via-blue-900/20 to-transparent shadow-xl">
+                                <div className="bg-[#090e1f]/90 backdrop-blur-sm rounded-2xl p-6 h-full flex flex-col justify-between border border-blue-500/10">
+                                    <div>
+                                        <div className="flex items-center justify-between mb-4">
+                                            <div className="flex items-center gap-2.5">
+                                                <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                                                    <ImageIcon className="w-5 h-5" />
+                                                </div>
+                                                <div>
+                                                    <h3 className="text-base font-semibold text-white">1. Foto Subjek Utama</h3>
+                                                    <p className="text-xs text-slate-400">Orang, barang, atau objek yang ingin dipertahankan</p>
+                                                </div>
+                                            </div>
+                                            {subjectImage && (
+                                                <button onClick={() => setSubjectImage(null)} className="text-xs text-rose-400 hover:text-rose-300 p-1.5 hover:bg-rose-500/10 rounded-lg transition-colors" title="Hapus foto">
+                                                    <Trash2 className="w-4 h-4" />
+                                                </button>
+                                            )}
+                                        </div>
+
+                                        {!subjectImage ? (
+                                            <div onClick={() => subjectInputRef.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files?.[0]) handleFileProcessing(e.dataTransfer.files[0], true); }} className="border-2 border-dashed border-blue-500/30 hover:border-blue-400/60 rounded-xl p-8 flex flex-col items-center justify-center gap-3 cursor-pointer bg-blue-950/10 hover:bg-blue-900/20 transition-all duration-300">
+                                                <div className="w-12 h-12 rounded-full bg-blue-500/10 border border-blue-400/20 flex items-center justify-center text-blue-400"><Upload className="w-6 h-6" /></div>
+                                                <div className="text-center"><p className="text-sm font-medium text-slate-200">Klik untuk unggah atau seret foto ke sini</p><p className="text-xs text-slate-500 mt-1">Mendukung PNG, JPG, WebP</p></div>
+                                            </div>
+                                        ) : (
+                                            <div className="relative rounded-xl overflow-hidden border border-blue-500/30 bg-black/40 aspect-video flex items-center justify-center group/preview">
+                                                <img src={subjectImage.url} alt="Subjek Utama" className="w-full h-full object-contain" />
+                                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover/preview:opacity-100 transition-opacity flex items-end p-3 justify-between">
+                                                    <span className="text-xs text-slate-300 bg-black/60 px-2 py-1 rounded backdrop-blur">{subjectImage.width} × {subjectImage.height} px</span>
+                                                    <button onClick={() => subjectInputRef.current?.click()} className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1 rounded shadow">Ganti Foto</button>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <input ref={subjectInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && handleFileProcessing(e.target.files[0], true)} />
+                                    </div>
+                                    {subjectImage && (
+                                        <div className="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+                                            <span className="truncate max-w-[200px]">{subjectImage.file.name}</span><span className="text-emerald-400 font-medium">Terunggah ✓</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Card 2: Foto Background Baru */}
+                            <div className="relative group rounded-2xl p-[1px] bg-gradient-to-b from-cyan-500/30 via-blue-900/20 to-transparent shadow-xl">
+                                <div className="bg-[#090e1f]/90 backdrop-blur-sm rounded-2xl p-6 h-full flex flex-col justify-between border border-cyan-500/10">
+                                    <div>
+                                        <div className="flex items-center justify-between mb-4">
+                                            <div className="flex items-center gap-2.5">
+                                                <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                                                    <Layers className="w-5 h-5" />
+                                                </div>
+                                                <div>
+                                                    <h3 className="text-base font-semibold text-white">2. Foto Background Baru</h3>
+                                                    <p className="text-xs text-slate-400">Pemandangan, studio, atau warna latar baru</p>
+                                                </div>
+                                            </div>
+                                            {bgImage && (
+                                                <button onClick={() => setBgImage(null)} className="text-xs text-rose-400 hover:text-rose-300 p-1.5 hover:bg-rose-500/10 rounded-lg transition-colors" title="Hapus foto background">
+                                                    <Trash2 className="w-4 h-4" />
+                                                </button>
+                                            )}
+                                        </div>
+
+                                        {!bgImage ? (
+                                            <div onClick={() => bgInputRef.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files?.[0]) handleFileProcessing(e.dataTransfer.files[0], false); }} className="border-2 border-dashed border-cyan-500/30 hover:border-cyan-400/60 rounded-xl p-8 flex flex-col items-center justify-center gap-3 cursor-pointer bg-cyan-950/10 hover:bg-cyan-900/20 transition-all duration-300">
+                                                <div className="w-12 h-12 rounded-full bg-cyan-500/10 border border-cyan-400/20 flex items-center justify-center text-cyan-400"><Upload className="w-6 h-6" /></div>
+                                                <div className="text-center"><p className="text-sm font-medium text-slate-200">Klik untuk unggah foto latar belakang</p><p className="text-xs text-slate-500 mt-1">Mendukung resolusi tinggi</p></div>
+                                            </div>
+                                        ) : (
+                                            <div className="relative rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 aspect-video flex items-center justify-center group/preview">
+                                                <img src={bgImage.url} alt="Background Baru" className="w-full h-full object-contain" />
+                                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover/preview:opacity-100 transition-opacity flex items-end p-3 justify-between">
+                                                    <span className="text-xs text-slate-300 bg-black/60 px-2 py-1 rounded backdrop-blur">{bgImage.width} × {bgImage.height} px</span>
+                                                    <button onClick={() => bgInputRef.current?.click()} className="text-xs bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1 rounded shadow">Ganti Foto</button>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <input ref={bgInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && handleFileProcessing(e.target.files[0], false)} />
+                                    </div>
+                                    {bgImage && (
+                                        <div className="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+                                            <span className="truncate max-w-[200px]">{bgImage.file.name}</span><span className="text-cyan-400 font-medium">Terunggah ✓</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-[#080d1e]/80 border border-blue-900/30 rounded-2xl p-6 backdrop-blur-md shadow-xl flex flex-col gap-6 w-full">
+                            <div>
+                                <div className="flex items-center justify-between mb-3">
+                                    <label className="text-sm font-semibold text-slate-200 flex items-center gap-2"><Ratio className="w-4 h-4 text-blue-400" />Mode Aspek Rasio:</label>
+                                    <span className="text-xs text-blue-400 bg-blue-950/60 border border-blue-500/20 px-2.5 py-1 rounded-md">Target Terpilih: {ratioMode === 'original' ? 'Sesuai Foto Bawaan' : ratioMode === 'custom' ? `${customRatio.w}:${customRatio.h} (Manual)` : ratioMode}</span>
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
+                                    {[
+                                        { id: 'original', label: 'Bawaan Foto', sub: 'Otomatis' },
+                                        { id: '1:1', label: '1:1', sub: 'Instagram Post' },
+                                        { id: '9:16', label: '9:16', sub: 'Story / TikTok' },
+                                        { id: '16:9', label: '16:9', sub: 'YouTube / Layar' },
+                                        { id: '4:5', label: '4:5', sub: 'IG Portrait' },
+                                        { id: '4:3', label: '4:3', sub: 'Standar Foto' },
+                                        { id: '3:4', label: '3:4', sub: 'Portrait' },
+                                        { id: 'custom', label: 'Pilih Manual', sub: 'Kustom Rasio' }
+                                    ].map((item) => (
+                                        <button key={item.id} onClick={() => setRatioMode(item.id)} className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all text-left ${ratioMode === item.id ? 'bg-gradient-to-b from-blue-600/30 to-blue-900/40 border-blue-400 text-white shadow-md shadow-blue-500/20' : 'bg-slate-900/50 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-800/40'}`}>
+                                            <span className="text-xs font-bold">{item.label}</span><span className="text-[10px] text-slate-400 tracking-tight mt-0.5 text-center">{item.sub}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                                {ratioMode === 'custom' && (
+                                    <div className="mt-4 p-4 rounded-xl bg-blue-950/20 border border-blue-500/30 flex flex-wrap items-center gap-4">
+                                        <div className="flex items-center gap-2"><span className="text-xs text-slate-300">Lebar (W):</span><input type="number" min="1" max="100" value={customRatio.w} onChange={(e) => setCustomRatio({ ...customRatio, w: e.target.value })} className="w-20 bg-slate-900 border border-blue-500/40 rounded-lg px-2.5 py-1 text-sm text-center focus:outline-none focus:border-cyan-400" /></div>
+                                        <span className="text-blue-400 font-bold">:</span>
+                                        <div className="flex items-center gap-2"><span className="text-xs text-slate-300">Tinggi (H):</span><input type="number" min="1" max="100" value={customRatio.h} onChange={(e) => setCustomRatio({ ...customRatio, h: e.target.value })} className="w-20 bg-slate-900 border border-blue-500/40 rounded-lg px-2.5 py-1 text-sm text-center focus:outline-none focus:border-cyan-400" /></div>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="h-px bg-slate-800/80" />
+
+                            <div>
+                                <div className="flex items-center justify-between mb-3">
+                                    <label className="text-sm font-semibold text-slate-200 flex items-center gap-2"><Maximize2 className="w-4 h-4 text-cyan-400" />Pilihan Resolusi Gambar:</label>
+                                    <span className="text-xs text-cyan-400 bg-cyan-950/60 border border-cyan-500/20 px-2.5 py-1 rounded-md">Dimensi Output: {activeRatioData.targetWidth} × {activeRatioData.targetHeight} px</span>
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                                    {[
+                                        { id: 'original', title: 'Resolusi Bawaan', spec: subjectImage ? `${subjectImage.width}×${subjectImage.height}` : 'Asli' },
+                                        { id: '720p', title: 'HD 720p', spec: 'Standard Quality' },
+                                        { id: '1080p', title: 'Full HD 1080p', spec: 'Rekomendasi (Tajam)' },
+                                        { id: '2k', title: '2K QHD', spec: '1440p High Res' },
+                                        { id: '4k', title: '4K Ultra HD', spec: '2160p Super Jernih' },
+                                        { id: 'custom', title: 'Kustom Piksel', spec: 'Atur Ukuran Sendiri' }
+                                    ].map((res) => (
+                                        <button key={res.id} onClick={() => setResolutionMode(res.id)} className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all text-left ${resolutionMode === res.id ? 'bg-gradient-to-b from-cyan-600/30 to-blue-900/40 border-cyan-400 text-white shadow-md shadow-cyan-500/20' : 'bg-slate-900/50 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-800/40'}`}>
+                                            <span className="text-xs font-bold text-center">{res.title}</span><span className="text-[10px] text-slate-400 mt-0.5 text-center">{res.spec}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                                {resolutionMode === 'custom' && (
+                                    <div className="mt-4 p-4 rounded-xl bg-cyan-950/20 border border-cyan-500/30 flex flex-wrap items-center gap-4">
+                                        <div className="flex items-center gap-2"><span className="text-xs text-slate-300">Lebar (px):</span><input type="number" min="300" max="7680" step="10" value={customResolution.width} onChange={(e) => setCustomResolution({ ...customResolution, width: e.target.value })} className="w-28 bg-slate-900 border border-cyan-500/40 rounded-lg px-2.5 py-1 text-sm text-center focus:outline-none focus:border-cyan-400" /></div>
+                                        <span className="text-cyan-400 font-bold">×</span>
+                                        <div className="flex items-center gap-2"><span className="text-xs text-slate-300">Tinggi (px):</span><input type="number" min="300" max="4320" step="10" value={customResolution.height} onChange={(e) => setCustomResolution({ ...customResolution, height: e.target.value })} className="w-28 bg-slate-900 border border-cyan-500/40 rounded-lg px-2.5 py-1 text-sm text-center focus:outline-none focus:border-cyan-400" /></div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col items-center gap-3">
+                            <button onClick={handleGenerate} disabled={loading || !subjectImage || !bgImage} className={`w-full max-w-md py-4 px-8 rounded-2xl font-bold text-base tracking-wider uppercase flex items-center justify-center gap-3 shadow-2xl transition-all duration-300 ${loading || !subjectImage || !bgImage ? 'bg-slate-800/80 text-slate-500 border border-slate-700/50 cursor-not-allowed opacity-60' : 'bg-gradient-to-r from-blue-600 via-indigo-600 to-cyan-500 hover:from-blue-500 hover:to-cyan-400 text-white shadow-blue-500/30 hover:shadow-cyan-500/40 hover:scale-[1.02] active:scale-[0.98]'}`}>
+                                {loading ? <><RefreshCw className="w-5 h-5 animate-spin text-cyan-300" /><span>MEMPROSES GAMBAR...</span></> : <><Sparkles className="w-5 h-5 text-cyan-300 animate-pulse" /><span>HASILKAN SEKARANG</span></>}
+                            </button>
+
+                            {loading && <div className="flex items-center gap-2 text-xs text-cyan-300 bg-cyan-950/40 border border-cyan-500/30 px-4 py-2 rounded-xl mt-1"><span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" /><span>{loadingStep}</span></div>}
+                            {errorMessage && <div className="flex items-center gap-2 text-xs text-rose-300 bg-rose-950/50 border border-rose-500/40 px-4 py-2.5 rounded-xl max-w-md text-center"><span>⚠️ {errorMessage}</span></div>}
+                            {(!subjectImage || !bgImage) && !loading && <p className="text-xs text-slate-500">* Harap unggah kedua foto di atas untuk mengaktifkan tombol ini</p>}
+                        </div>
+
+                        {resultImage && (
+                            <div className="mt-4 bg-[#080d1e]/90 border border-blue-500/30 rounded-3xl p-6 sm:p-8 backdrop-blur-xl shadow-2xl shadow-blue-950/50">
+                                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-6 border-b border-blue-900/40">
+                                    <div>
+                                        <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-1"><Check className="w-4 h-4" /> Berhasil Digenerate</div>
+                                        <h3 className="text-xl font-bold text-white">Hasil Foto Background Baru</h3>
+                                        <p className="text-xs text-slate-400 mt-0.5">Rasio: {ratioMode} | Resolusi: {resultDimensions?.width} × {resultDimensions?.height} px</p>
+                                    </div>
+                                    <div className="flex items-center gap-3 w-full sm:w-auto">
+                                        <button onClick={() => setIsPreviewOpen(true)} className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 transition"><ZoomIn className="w-4 h-4" /> Perbesar</button>
+                                        <button onClick={handleDownload} className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-500 hover:to-cyan-400 text-white text-xs font-bold shadow-lg shadow-blue-600/30 transition hover:scale-105"><Download className="w-4 h-4" /> Unduh Gambar</button>
+                                    </div>
+                                </div>
+                                <div className="mt-6 flex flex-col items-center">
+                                    <div className="relative max-w-4xl w-full rounded-2xl overflow-hidden border border-blue-500/40 bg-black/60 shadow-inner flex items-center justify-center group">
+                                        <img src={resultImage} alt="Hasil Akhir Ganti Background" className="w-full h-auto max-h-[650px] object-contain" />
+                                    </div>
+                                    <div className="mt-4 flex flex-wrap items-center justify-center gap-4 text-xs text-slate-400">
+                                        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-blue-400" />Format: PNG Berkualitas Tinggi</span>
+                                        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-cyan-400" />Pencahayaan & Bayangan Disesuaikan</span>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+
+                    {isPreviewOpen && resultImage && (
+                        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 sm:p-8" onClick={() => setIsPreviewOpen(false)}>
+                            <div className="relative max-w-6xl w-full max-h-[90vh] flex flex-col items-center">
+                                <button onClick={() => setIsPreviewOpen(false)} className="absolute -top-12 right-0 text-slate-300 hover:text-white bg-slate-800/80 px-3 py-1.5 rounded-lg text-xs">Tutup [✕]</button>
+                                <img src={resultImage} alt="Preview Zoom" className="max-w-full max-h-[85vh] object-contain rounded-xl shadow-2xl border border-blue-500/40" onClick={(e) => e.stopPropagation()} />
+                            </div>
+                        </div>
+                    )}
+
+                    <footer className="border-t border-blue-900/30 bg-[#050811] py-6 text-center text-xs text-slate-500 mt-12">
+                        <p>© 2026 AutoBG Studio AI. Ditenagai oleh Google Gemini API (gemini-3.1-flash-image).</p>
+                    </footer>
+                </div>
+            );
+        }
+
+        const rootElement = document.getElementById('root');
+        const root = createRoot(rootElement);
+        root.render(<App />);
+    </script>
+</body>
+</html>
